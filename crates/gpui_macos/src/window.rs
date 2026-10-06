@@ -963,6 +963,7 @@ impl MacWindow {
             titlebar,
             kind,
             is_movable,
+            is_click_through,
             app_owns_titlebar_drag,
             is_resizable,
             is_minimizable,
@@ -1166,6 +1167,7 @@ impl MacWindow {
             }
 
             native_window.setMovable_(is_movable as BOOL);
+            let () = msg_send![native_window, setIgnoresMouseEvents: is_click_through as BOOL];
 
             if let Some(window_min_size) = window_min_size {
                 native_window.setContentMinSize_(NSSize {

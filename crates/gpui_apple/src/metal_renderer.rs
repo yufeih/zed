@@ -107,6 +107,7 @@ impl InstanceBufferPool {
 }
 
 pub struct MetalRenderer {
+    custom_shader_pipelines: std::collections::HashMap<u64, metal::RenderPipelineState>,
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
@@ -366,6 +367,7 @@ impl MetalRenderer {
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
         Self {
+            custom_shader_pipelines: Default::default(),
             device,
             layer,
             presents_with_transaction: false,
@@ -767,13 +769,18 @@ impl MetalRenderer {
                         viewport_size,
                         command_encoder,
                     ),
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
-                    &scene.surfaces[range.clone()],
-                    range.start,
-                    instance_bindings,
-                    viewport_size,
-                    command_encoder,
-                ),
+                PrimitiveBatch::Surfaces(range) => {
+                    if let Err(error) = self.draw_surfaces(
+                        &scene.surfaces[range.clone()],
+                        range.start,
+                        instance_bindings,
+                        viewport_size,
+                        command_encoder,
+                    ) {
+                        command_encoder.end_encoding();
+                        return Err(error);
+                    }
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -1162,6 +1169,70 @@ impl MetalRenderer {
         );
     }
 
+    fn draw_custom_shader(
+        &mut self,
+        surface: &PaintSurface,
+        shader: &gpui::ShaderSurface,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> Result<()> {
+        let pipeline = match self.custom_shader_pipelines.entry(shader.shader.id()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let program = shader.shader.msl();
+                let library = self
+                    .device
+                    .new_library_with_source(&program.source, &metal::CompileOptions::new())
+                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.shader.label()))?;
+                let vertex = library
+                    .get_function(&program.vertex_entry, None)
+                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.shader.label()))?;
+                let fragment = library
+                    .get_function(&program.fragment_entry, None)
+                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.shader.label()))?;
+                let descriptor = metal::RenderPipelineDescriptor::new();
+                descriptor.set_label(shader.shader.label());
+                descriptor.set_vertex_function(Some(&vertex));
+                descriptor.set_fragment_function(Some(&fragment));
+                let color = descriptor
+                    .color_attachments()
+                    .object_at(0)
+                    .ok_or_else(|| anyhow::anyhow!("custom shader color attachment missing"))?;
+                color.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+                color.set_blending_enabled(true);
+                color.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+                color.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+                color.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+                color
+                    .set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+                entry.insert(
+                    self.device
+                        .new_render_pipeline_state(&descriptor)
+                        .map_err(|error| anyhow::anyhow!("{}: {error}", shader.shader.label()))?,
+                )
+            }
+        };
+        let uniforms = shader.uniforms(
+            surface,
+            [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
+            false,
+            false,
+        );
+        command_encoder.set_render_pipeline_state(pipeline);
+        command_encoder.set_vertex_bytes(
+            0,
+            mem::size_of_val(&uniforms) as u64,
+            uniforms.as_ptr().cast(),
+        );
+        command_encoder.set_fragment_bytes(
+            0,
+            mem::size_of_val(&uniforms) as u64,
+            uniforms.as_ptr().cast(),
+        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+        Ok(())
+    }
+
     fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
@@ -1169,58 +1240,65 @@ impl MetalRenderer {
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
-    ) {
+    ) -> Result<()> {
         if surfaces.is_empty() {
-            return;
+            return Ok(());
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
-        command_encoder.set_vertex_buffer(
-            SurfaceInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
-            0,
-        );
-        command_encoder.set_vertex_buffer(
-            SurfaceInputIndex::Surfaces as u64,
-            Some(&instance_bindings.surfaces.buffer),
-            instance_bindings.surfaces.offset as u64,
-        );
-        command_encoder.set_vertex_bytes(
-            SurfaceInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
-        );
-
         for (index, surface) in surfaces.iter().enumerate() {
+            let image_buffer = match &surface.source {
+                gpui::PaintSurfaceSource::Shader(shader) => {
+                    self.draw_custom_shader(surface, shader, viewport_size, command_encoder)?;
+                    continue;
+                }
+                gpui::PaintSurfaceSource::ImageBuffer(image_buffer) => image_buffer,
+            };
+            command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+            command_encoder.set_vertex_buffer(
+                SurfaceInputIndex::Vertices as u64,
+                Some(&self.unit_vertices),
+                0,
+            );
+            command_encoder.set_vertex_buffer(
+                SurfaceInputIndex::Surfaces as u64,
+                Some(&instance_bindings.surfaces.buffer),
+                instance_bindings.surfaces.offset as u64,
+            );
+            command_encoder.set_vertex_bytes(
+                SurfaceInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport_size) as u64,
+                &viewport_size as *const Size<DevicePixels> as *const _,
+            );
+
             let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
+                DevicePixels::from(image_buffer.get_width() as i32),
+                DevicePixels::from(image_buffer.get_height() as i32),
             );
 
             assert_eq!(
-                surface.image_buffer.get_pixel_format(),
+                image_buffer.get_pixel_format(),
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             );
 
             let y_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
+                    image_buffer.get_width_of_plane(0),
+                    image_buffer.get_height_of_plane(0),
                     0,
                 )
                 .unwrap();
             let cb_cr_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
+                    image_buffer.get_width_of_plane(1),
+                    image_buffer.get_height_of_plane(1),
                     1,
                 )
                 .unwrap();
@@ -1248,6 +1326,7 @@ impl MetalRenderer {
                 (first_surface + index) as u64,
             );
         }
+        Ok(())
     }
 }
 

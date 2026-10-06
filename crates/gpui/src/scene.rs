@@ -769,8 +769,15 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub source: PaintSurfaceSource,
+}
+
+#[derive(Clone, Debug)]
+#[expect(missing_docs)]
+pub enum PaintSurfaceSource {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    ImageBuffer(core_video::pixel_buffer::CVPixelBuffer),
+    Shader(crate::ShaderSurface),
 }
 
 impl From<PaintSurface> for Primitive {

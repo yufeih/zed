@@ -75,6 +75,7 @@ inventory.workspace = true
 itertools.workspace = true
 log.workspace = true
 num_cpus = "1.13"
+naga = { version = "29.0.4", features = ["wgsl-in", "hlsl-out", "msl-out"] }
 parking = "2.0.0"
 parking_lot.workspace = true
 postage = { workspace = true, features = ["blocking"], optional = true }

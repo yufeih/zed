@@ -84,6 +84,7 @@ struct DirectXResources {
 }
 
 struct DirectXRenderPipelines {
+    custom_shaders: std::collections::HashMap<u64, CustomShaderPipeline>,
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
@@ -814,8 +815,53 @@ impl DirectXRenderer {
     }
 
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
-        if surfaces.is_empty() {
-            return Ok(());
+        let devices = self.devices.as_ref().context("devices missing")?;
+        for surface in surfaces {
+            let PaintSurfaceSource::Shader(shader) = &surface.source;
+            let pipeline = match self.pipelines.custom_shaders.entry(shader.shader.id()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    CustomShaderPipeline::new(&devices.device, &shader.shader).with_context(
+                        || format!("compiling custom shader {}", shader.shader.label()),
+                    )?,
+                ),
+            };
+            let uniforms = shader.uniforms(
+                surface,
+                [self.width as f32, self.height as f32],
+                false,
+                false,
+            );
+            update_buffer(
+                &devices.device_context,
+                &pipeline.uniforms,
+                slice::from_ref(&uniforms),
+            )?;
+            set_pipeline_state(
+                &devices.device_context,
+                &[],
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                &pipeline.vertex,
+                &pipeline.fragment,
+                &pipeline.blend_state,
+            );
+            unsafe {
+                let buffers = [Some(pipeline.uniforms.clone())];
+                devices
+                    .device_context
+                    .VSSetConstantBuffers(0, Some(&buffers));
+                devices
+                    .device_context
+                    .PSSetConstantBuffers(0, Some(&buffers));
+                devices.device_context.Draw(4, 0);
+                let buffers = [self.globals.global_params_buffer.clone()];
+                devices
+                    .device_context
+                    .VSSetConstantBuffers(0, Some(&buffers));
+                devices
+                    .device_context
+                    .PSSetConstantBuffers(0, Some(&buffers));
+            }
         }
         Ok(())
     }
@@ -999,6 +1045,7 @@ impl DirectXRenderPipelines {
         )?;
 
         Ok(Self {
+            custom_shaders: Default::default(),
             shadow_pipeline,
             quad_pipeline,
             path_rasterization_pipeline,
@@ -1094,6 +1141,75 @@ struct PipelineState<T> {
     view: Option<ID3D11ShaderResourceView>,
     blend_state: ID3D11BlendState,
     _marker: std::marker::PhantomData<T>,
+}
+
+struct CustomShaderPipeline {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+    uniforms: ID3D11Buffer,
+    blend_state: ID3D11BlendState,
+}
+
+impl CustomShaderPipeline {
+    fn new(device: &ID3D11Device, shader: &CustomShader) -> Result<Self> {
+        fn compile(source: &str, entry: &str, target: &str) -> Result<Vec<u8>> {
+            use std::ffi::CString;
+            use windows::{
+                Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile},
+                core::PCSTR,
+            };
+            let entry = CString::new(entry)?;
+            let target = CString::new(target)?;
+            let mut bytes = None;
+            let mut errors = None;
+            let result = unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    PCSTR::null(),
+                    None,
+                    None,
+                    PCSTR(entry.as_ptr().cast()),
+                    PCSTR(target.as_ptr().cast()),
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                    0,
+                    &mut bytes,
+                    Some(&mut errors),
+                )
+            };
+            result.with_context(|| {
+                errors
+                    .as_ref()
+                    .map(|errors| unsafe {
+                        String::from_utf8_lossy(slice::from_raw_parts(
+                            errors.GetBufferPointer().cast(),
+                            errors.GetBufferSize(),
+                        ))
+                        .into_owned()
+                    })
+                    .unwrap_or_else(|| "DirectX custom shader compilation failed".into())
+            })?;
+            let bytes = bytes.context("DirectX compiler returned no bytecode")?;
+            Ok(unsafe {
+                slice::from_raw_parts(bytes.GetBufferPointer().cast(), bytes.GetBufferSize())
+            }
+            .to_vec())
+        }
+        let program = shader.hlsl();
+        Ok(Self {
+            vertex: create_vertex_shader(
+                device,
+                &compile(&program.source, &program.vertex_entry, "vs_5_0")?,
+            )?,
+            fragment: create_fragment_shader(
+                device,
+                &compile(&program.source, &program.fragment_entry, "ps_5_0")?,
+            )?,
+            uniforms: create_constant_buffer::<[[f32; 4]; 8]>(device)?
+                .context("creating custom shader uniforms")?,
+            blend_state: create_blend_state(device)?,
+        })
+    }
 }
 
 impl<T> PipelineState<T> {

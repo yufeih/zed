@@ -2458,6 +2458,9 @@ pub struct WindowOptions {
     /// Window-menu tiling items); programmatic moves are still allowed.
     pub is_movable: bool,
 
+    /// Whether pointer input passes through the window to the content underneath.
+    pub is_click_through: bool,
+
     /// Whether the application owns dragging of the (custom) titlebar, rather than
     /// AppKit. Only has an effect on macOS.
     ///
@@ -2530,6 +2533,7 @@ pub struct WindowParams {
     /// Whether the window should be movable by the user
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub is_movable: bool,
+    pub is_click_through: bool,
 
     /// Whether the application owns dragging of the (custom) titlebar (macOS only)
     #[cfg_attr(
@@ -2619,6 +2623,7 @@ impl Default for WindowOptions {
             show: true,
             kind: WindowKind::Normal,
             is_movable: true,
+            is_click_through: false,
             app_owns_titlebar_drag: false,
             inactive_frame_interval: Some(Duration::from_micros(33_333)),
             is_resizable: true,

@@ -144,7 +144,7 @@ impl WebWindow {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         _handle: AnyWindowHandle,
-        _params: WindowParams,
+        params: WindowParams,
         context: &WgpuContext,
         canvas: web_sys::HtmlCanvasElement,
         surface: wgpu::Surface<'static>,
@@ -152,6 +152,14 @@ impl WebWindow {
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
     ) -> anyhow::Result<Self> {
+        if params.is_click_through {
+            canvas
+                .style()
+                .set_property("pointer-events", "none")
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to make canvas click-through: {error:?}")
+                })?;
+        }
         let document = browser_window
             .document()
             .ok_or_else(|| anyhow::anyhow!("No `document` found on window"))?;

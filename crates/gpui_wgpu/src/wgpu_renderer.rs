@@ -180,6 +180,8 @@ enum InstanceData {
 
 /// GPU resources that must be dropped together during device recovery.
 struct WgpuResources {
+    custom_shader_pipelines: FxHashMap<u64, wgpu::RenderPipeline>,
+    shader_surfaces: Vec<ShaderSurfaceResources>,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipelines: WgpuPipelines,
@@ -194,6 +196,12 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+}
+
+struct ShaderSurfaceResources {
+    shader_id: u64,
+    uniforms: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 struct CachedTextureBindGroup {
@@ -1339,6 +1347,8 @@ impl WgpuRendererCore {
 
         Self {
             resources: WgpuResources {
+                custom_shader_pipelines: FxHashMap::default(),
+                shader_surfaces: Vec::new(),
                 device,
                 queue,
                 pipelines,
@@ -1435,6 +1445,7 @@ impl WgpuRendererCore {
 
         self.atlas.before_frame();
         self.ensure_intermediate_textures(size);
+        self.prepare_shader_surfaces(scene, size)?;
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1609,9 +1620,19 @@ impl WgpuRendererCore {
                             &mut pass,
                         )?;
                     }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(range) => {
+                        for index in range {
+                            let surface = &self.resources.shader_surfaces[index];
+                            let pipeline = self
+                                .resources
+                                .custom_shader_pipelines
+                                .get(&surface.shader_id)
+                                .context("custom shader pipeline missing")?;
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(0, &surface.bind_group, &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                    }
                 }
             }
         }
@@ -1621,6 +1642,106 @@ impl WgpuRendererCore {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(submission)
+    }
+
+    fn prepare_shader_surfaces(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()> {
+        let resources = &mut self.resources;
+        for (index, surface) in scene.surfaces.iter().enumerate() {
+            let shader = match &surface.source {
+                gpui::PaintSurfaceSource::Shader(shader) => shader,
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                gpui::PaintSurfaceSource::ImageBuffer(_) => {
+                    anyhow::bail!("CoreVideo surfaces are not supported by the wgpu renderer");
+                }
+            };
+            let pipeline = resources
+                .custom_shader_pipelines
+                .entry(shader.shader.id())
+                .or_insert_with(|| {
+                    let module =
+                        resources
+                            .device
+                            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                                label: Some(shader.shader.label()),
+                                source: wgpu::ShaderSource::Wgsl(shader.shader.wgsl().into()),
+                            });
+                    resources
+                        .device
+                        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: Some(shader.shader.label()),
+                            layout: None,
+                            vertex: wgpu::VertexState {
+                                module: &module,
+                                entry_point: Some("gpui_shader_vertex"),
+                                buffers: &[],
+                                compilation_options: Default::default(),
+                            },
+                            fragment: Some(wgpu::FragmentState {
+                                module: &module,
+                                entry_point: Some("gpui_shader_fragment"),
+                                targets: &[Some(wgpu::ColorTargetState {
+                                    format: self.target_format,
+                                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                                    write_mask: wgpu::ColorWrites::ALL,
+                                })],
+                                compilation_options: Default::default(),
+                            }),
+                            primitive: wgpu::PrimitiveState {
+                                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                                ..Default::default()
+                            },
+                            depth_stencil: None,
+                            multisample: Default::default(),
+                            multiview_mask: None,
+                            cache: None,
+                        })
+                });
+            if resources
+                .shader_surfaces
+                .get(index)
+                .is_none_or(|surface| surface.shader_id != shader.shader.id())
+            {
+                let uniforms = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("custom_shader_uniforms"),
+                    size: 128,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("custom_shader_uniforms"),
+                        layout: &pipeline.get_bind_group_layout(0),
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniforms.as_entire_binding(),
+                        }],
+                    });
+                let entry = ShaderSurfaceResources {
+                    shader_id: shader.shader.id(),
+                    uniforms,
+                    bind_group,
+                };
+                if index == resources.shader_surfaces.len() {
+                    resources.shader_surfaces.push(entry);
+                } else {
+                    resources.shader_surfaces[index] = entry;
+                }
+            }
+            let uniforms = shader.uniforms(
+                surface,
+                [size.width.0 as f32, size.height.0 as f32],
+                true,
+                true,
+            );
+            resources.queue.write_buffer(
+                &resources.shader_surfaces[index].uniforms,
+                0,
+                bytemuck::cast_slice(&uniforms),
+            );
+        }
+        resources.shader_surfaces.truncate(scene.surfaces.len());
+        Ok(())
     }
 
     fn write_instances(

@@ -21,6 +21,7 @@ use x11rb::{
     errors::ConnectionError,
     properties::{WmHints, WmSizeHints},
     protocol::{
+        shape::{self, ConnectionExt as _},
         sync,
         xinput::{self, ConnectionExt as _},
         xproto::{self, ClientMessageEvent, ConnectionExt, TranslateCoordinatesReply},
@@ -563,6 +564,20 @@ impl X11WindowState {
 
         // Collect errors during setup, so that window can be destroyed on failure.
         let setup_result = maybe!({
+            if params.is_click_through {
+                check_reply(
+                    || "X11 click-through input shape failed.",
+                    xcb.shape_rectangles(
+                        shape::SO::SET,
+                        shape::SK::INPUT,
+                        xproto::ClipOrdering::UNSORTED,
+                        x_window,
+                        0,
+                        0,
+                        &[],
+                    ),
+                )?;
+            }
             let pid = std::process::id();
             check_reply(
                 || "X11 ChangeProperty for _NET_WM_PID failed.",

@@ -14,6 +14,7 @@ mod asset_cache;
 mod assets;
 mod bounds_tree;
 mod color;
+mod custom_shader;
 /// The default colors used by GPUI.
 pub mod colors;
 #[cfg(feature = "profiler")]
@@ -104,6 +105,7 @@ pub(crate) use arena::*;
 pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
+pub use custom_shader::*;
 pub use ctor::ctor;
 #[cfg(feature = "profiler")]
 pub use debug_overlay::*;

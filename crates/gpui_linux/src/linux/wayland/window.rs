@@ -835,6 +835,11 @@ impl WaylandWindow {
         target_output: Option<wl_output::WlOutput>,
     ) -> anyhow::Result<(Self, ObjectId)> {
         let surface = globals.compositor.create_surface(&globals.qh, ());
+        if params.is_click_through {
+            let input_region = globals.compositor.create_region(&globals.qh, ());
+            surface.set_input_region(Some(&input_region));
+            input_region.destroy();
+        }
         let surface_state = WaylandSurfaceState::new(
             &surface,
             &globals,

@@ -1580,6 +1580,7 @@ impl Window {
             show,
             kind,
             is_movable,
+            is_click_through,
             app_owns_titlebar_drag,
             inactive_frame_interval,
             is_resizable,
@@ -1610,6 +1611,7 @@ impl Window {
                 titlebar,
                 kind,
                 is_movable,
+                is_click_through,
                 app_owns_titlebar_drag,
                 is_resizable,
                 is_minimizable,
@@ -5062,6 +5064,31 @@ impl Window {
         Ok(())
     }
 
+    /// Paint a portable shader with logical-pixel coordinates and application-defined parameters.
+    pub fn paint_shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        shader: Arc<crate::CustomShader>,
+        parameters: [[f32; 4]; 4],
+    ) {
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        let scale_factor = self.scale_factor();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_primitive(crate::PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            source: crate::PaintSurfaceSource::Shader(crate::ShaderSurface {
+                shader,
+                parameters,
+                scale_factor,
+                opacity,
+            }),
+        });
+    }
+
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -5077,7 +5104,7 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            source: crate::PaintSurfaceSource::ImageBuffer(image_buffer),
         });
     }
 
