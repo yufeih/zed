@@ -372,7 +372,8 @@ impl MetalRenderer {
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
-        let empty_shader_input = ShaderTexture::image(&device, [1, 1], &[0; 4]);
+        let empty_shader_input =
+            ShaderTexture::image(&device, [1, 1], &[0; 4], supports_shared_storage);
         Self {
             custom_shader_pipelines: Default::default(),
             shader_targets: Vec::new(),
@@ -1272,7 +1273,12 @@ impl MetalRenderer {
                                     Arc::downgrade(&image.image),
                                     ShaderTexture {
                                         size,
-                                        texture: ShaderTexture::image(&self.device, size, &bytes),
+                                        texture: ShaderTexture::image(
+                                            &self.device,
+                                            size,
+                                            &bytes,
+                                            cfg!(target_os = "ios") || self.is_apple_gpu,
+                                        ),
                                     },
                                 ));
                             }
@@ -1454,12 +1460,21 @@ struct ShaderTexture {
 }
 
 impl ShaderTexture {
-    fn image(device: &metal::DeviceRef, size: [u32; 2], bytes: &[u8]) -> metal::Texture {
+    fn image(
+        device: &metal::DeviceRef,
+        size: [u32; 2],
+        bytes: &[u8],
+        supports_shared_storage: bool,
+    ) -> metal::Texture {
         let descriptor = metal::TextureDescriptor::new();
         descriptor.set_width(size[0] as u64);
         descriptor.set_height(size[1] as u64);
         descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
-        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        descriptor.set_storage_mode(if supports_shared_storage {
+            metal::MTLStorageMode::Shared
+        } else {
+            metal::MTLStorageMode::Managed
+        });
         descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
         let texture = device.new_texture(&descriptor);
         texture.replace_region(
