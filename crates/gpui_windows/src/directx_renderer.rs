@@ -993,7 +993,9 @@ impl DirectXRenderer {
                 devices
                     .device_context
                     .PSSetConstantBuffers(0, Some(&buffers));
-                devices.device_context.PSSetShaderResources(0, Some(&[None, None]));
+                devices
+                    .device_context
+                    .PSSetShaderResources(0, Some(&[None, None]));
             }
         }
         Ok(())
@@ -1421,15 +1423,19 @@ impl CustomShaderPipeline {
             .to_vec())
         }
         let program = shader.hlsl();
+        let compiled;
+        let (vertex, fragment) = if let Some(bytecode) = shader.directx_bytecode() {
+            (bytecode.vertex.as_slice(), bytecode.fragment.as_slice())
+        } else {
+            compiled = (
+                compile(&program.source, &program.vertex_entry, "vs_5_0")?,
+                compile(&program.source, &program.fragment_entry, "ps_5_0")?,
+            );
+            (compiled.0.as_slice(), compiled.1.as_slice())
+        };
         Ok(Self {
-            vertex: create_vertex_shader(
-                device,
-                &compile(&program.source, &program.vertex_entry, "vs_5_0")?,
-            )?,
-            fragment: create_fragment_shader(
-                device,
-                &compile(&program.source, &program.fragment_entry, "ps_5_0")?,
-            )?,
+            vertex: create_vertex_shader(device, vertex)?,
+            fragment: create_fragment_shader(device, fragment)?,
             uniforms: create_constant_buffer::<[[f32; 4]; 8]>(device)?
                 .context("creating custom shader uniforms")?,
             blend_state: create_blend_state(device)?,

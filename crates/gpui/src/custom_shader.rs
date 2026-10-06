@@ -8,6 +8,8 @@ use collections::FxHashMap;
 
 use crate::{PaintSurface, RenderImage, RenderImageParams, SharedString};
 
+static NEXT_SHADER_ID: AtomicU64 = AtomicU64::new(0);
+
 /// A validated portable fragment shader. Define
 /// `fn paint(position: vec2<f32>, size: vec2<f32>, parameters: array<vec4<f32>, 4>) -> vec4<f32>`.
 /// Coordinates are logical pixels; return straight-alpha sRGB. GPUI supplies clipping,
@@ -27,6 +29,16 @@ pub struct CustomShader {
     hlsl: ShaderProgram,
     /// Translated Metal program.
     msl: ShaderProgram,
+    directx_bytecode: Option<ShaderBytecode>,
+}
+
+/// Ahead-of-time compiled DirectX vertex and fragment stages.
+#[derive(Debug)]
+pub struct ShaderBytecode {
+    /// Vertex shader compiled for shader model 5.0.
+    pub vertex: Vec<u8>,
+    /// Fragment shader compiled for shader model 5.0.
+    pub fragment: Vec<u8>,
 }
 
 /// A native translation of a portable shader.
@@ -41,6 +53,47 @@ pub struct ShaderProgram {
 }
 
 impl CustomShader {
+    /// Load build-time validated translations and optional DirectX bytecode.
+    ///
+    /// Generate all programs from the same source with [`Self::new`] at build time.
+    /// Bytecode must use those programs' entry points, bindings, and shader model.
+    pub fn from_precompiled(
+        label: impl Into<SharedString>,
+        wgsl: String,
+        hlsl: ShaderProgram,
+        msl: ShaderProgram,
+        directx_bytecode: Option<ShaderBytecode>,
+    ) -> Result<Arc<Self>> {
+        ensure!(!wgsl.is_empty(), "precompiled WGSL source is empty");
+        for program in [&hlsl, &msl] {
+            ensure!(
+                !program.source.is_empty()
+                    && !program.vertex_entry.is_empty()
+                    && !program.fragment_entry.is_empty(),
+                "precompiled shader translation is incomplete"
+            );
+        }
+        if let Some(bytecode) = &directx_bytecode {
+            ensure!(
+                !bytecode.vertex.is_empty() && !bytecode.fragment.is_empty(),
+                "precompiled DirectX bytecode is empty"
+            );
+        }
+        Ok(Arc::new(Self {
+            id: NEXT_SHADER_ID.fetch_add(1, Ordering::Relaxed),
+            label: label.into(),
+            wgsl,
+            hlsl,
+            msl,
+            directx_bytecode,
+        }))
+    }
+
+    /// Optional build-time DirectX compilation, independent of the GPU device.
+    pub fn directx_bytecode(&self) -> Option<&ShaderBytecode> {
+        self.directx_bytecode.as_ref()
+    }
+
     /// Stable identity of this immutable program.
     pub fn id(&self) -> u64 {
         self.id
@@ -68,7 +121,6 @@ impl CustomShader {
 
     /// Validate and translate once, then retain the returned shader across frames.
     pub fn new(label: impl Into<SharedString>, source: &str) -> Result<Arc<Self>> {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let label = label.into();
         let wgsl = format!("{source}\n{}", include_str!("custom_shader.wgsl"));
         let module = naga::front::wgsl::parse_str(&wgsl)
@@ -178,7 +230,7 @@ impl CustomShader {
             .try_into()
             .map_err(|_| anyhow!("{label}: missing MSL entry points"))?;
         Ok(Arc::new(Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: NEXT_SHADER_ID.fetch_add(1, Ordering::Relaxed),
             label,
             wgsl,
             hlsl,
@@ -187,6 +239,7 @@ impl CustomShader {
                 vertex_entry,
                 fragment_entry,
             },
+            directx_bytecode: None,
         }))
     }
 }
