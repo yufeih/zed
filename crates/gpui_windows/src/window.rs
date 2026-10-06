@@ -489,7 +489,8 @@ impl WindowsWindow {
         );
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
+            // A zero style creates an overlapped window, which implicitly receives WS_CAPTION.
+            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WS_POPUP)
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -521,6 +522,18 @@ impl WindowsWindow {
         }
         .or_else(WindowsDisplay::primary_monitor)
         .context("failed to find any monitor")?;
+        let (x, y, width, height) = if params.kind == WindowKind::PopUp {
+            // CW_USEDEFAULT is only supported for overlapped windows.
+            let bounds = params.bounds.to_device_pixels(display.scale_factor());
+            (
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+                bounds.size.width.0,
+                bounds.size.height.0,
+            )
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT)
+        };
         let appearance = system_appearance().unwrap_or_default();
         let mut context = WindowCreateContext {
             inner: None,
@@ -551,10 +564,10 @@ impl WindowsWindow {
                 WINDOW_CLASS_NAME,
                 &window_name,
                 dwstyle,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                x,
+                y,
+                width,
+                height,
                 parent_hwnd,
                 None,
                 Some(hinstance.into()),

@@ -2656,6 +2656,9 @@ pub enum WindowKind {
 
     /// A window that appears above all other windows, usually used for alerts or popups
     /// use sparingly!
+    ///
+    /// On Windows this creates a borderless native popup. Combine it with
+    /// [`WindowBackgroundAppearance::Transparent`] to draw a custom-shaped surface.
     PopUp,
 
     /// A parent-anchored, platform-native popup window for menus, comboboxes, context menus and
