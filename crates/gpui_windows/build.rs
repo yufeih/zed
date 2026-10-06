@@ -1,17 +1,23 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
-    #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+    #[cfg(not(all(
+        target_os = "windows",
+        any(not(debug_assertions), feature = "precompiled-shaders")
+    )))]
     println!("cargo:rerun-if-changed=build.rs");
     #[cfg(target_os = "windows")]
     {
         // Compile HLSL shaders
-        #[cfg(not(debug_assertions))]
+        #[cfg(any(not(debug_assertions), feature = "precompiled-shaders"))]
         compile_shaders();
     }
 }
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
+#[cfg(all(
+    target_os = "windows",
+    any(not(debug_assertions), feature = "precompiled-shaders")
+))]
 mod shader_compilation {
     use std::{
         fs,
@@ -240,5 +246,8 @@ mod shader_compilation {
     }
 }
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
+#[cfg(all(
+    target_os = "windows",
+    any(not(debug_assertions), feature = "precompiled-shaders")
+))]
 use shader_compilation::compile_shaders;

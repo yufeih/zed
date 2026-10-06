@@ -16,6 +16,7 @@ doctest = false
 default = ["gpui/default"]
 test-support = ["gpui/test-support"]
 screen-capture = ["gpui/screen-capture", "scap"]
+precompiled-shaders = []
 
 [dependencies]
 gpui.workspace = true
