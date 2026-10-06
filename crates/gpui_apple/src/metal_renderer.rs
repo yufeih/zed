@@ -107,7 +107,13 @@ impl InstanceBufferPool {
 }
 
 pub struct MetalRenderer {
-    custom_shader_pipelines: std::collections::HashMap<u64, metal::RenderPipelineState>,
+    custom_shader_pipelines: std::collections::HashMap<(u64, bool), metal::RenderPipelineState>,
+    shader_targets: Vec<ShaderTexture>,
+    shader_images: std::collections::HashMap<
+        gpui::RenderImageParams,
+        (std::sync::Weak<gpui::RenderImage>, ShaderTexture),
+    >,
+    empty_shader_input: metal::Texture,
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
@@ -366,8 +372,12 @@ impl MetalRenderer {
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
+        let empty_shader_input = ShaderTexture::image(&device, [1, 1], &[0; 4]);
         Self {
             custom_shader_pipelines: Default::default(),
+            shader_targets: Vec::new(),
+            shader_images: Default::default(),
+            empty_shader_input,
             device,
             layer,
             presents_with_transaction: false,
@@ -704,6 +714,7 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
+        let shader_inputs = self.prepare_shader_surfaces(scene, command_buffer)?;
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -776,6 +787,7 @@ impl MetalRenderer {
                         instance_bindings,
                         viewport_size,
                         command_encoder,
+                        &shader_inputs[range],
                     ) {
                         command_encoder.end_encoding();
                         return Err(error);
@@ -1169,37 +1181,39 @@ impl MetalRenderer {
         );
     }
 
-    fn draw_custom_shader(
+    fn custom_shader_pipeline(
         &mut self,
-        surface: &PaintSurface,
-        shader: &gpui::ShaderSurface,
-        viewport_size: Size<DevicePixels>,
-        command_encoder: &metal::RenderCommandEncoderRef,
-    ) -> Result<()> {
-        let pipeline = match self.custom_shader_pipelines.entry(shader.shader.id()) {
+        shader: &gpui::CustomShader,
+        raw: bool,
+    ) -> Result<metal::RenderPipelineState> {
+        let pipeline = match self.custom_shader_pipelines.entry((shader.id(), raw)) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let program = shader.shader.msl();
+                let program = shader.msl();
                 let library = self
                     .device
                     .new_library_with_source(&program.source, &metal::CompileOptions::new())
-                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.shader.label()))?;
+                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.label()))?;
                 let vertex = library
                     .get_function(&program.vertex_entry, None)
-                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.shader.label()))?;
+                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.label()))?;
                 let fragment = library
                     .get_function(&program.fragment_entry, None)
-                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.shader.label()))?;
+                    .map_err(|error| anyhow::anyhow!("{}: {error}", shader.label()))?;
                 let descriptor = metal::RenderPipelineDescriptor::new();
-                descriptor.set_label(shader.shader.label());
+                descriptor.set_label(shader.label());
                 descriptor.set_vertex_function(Some(&vertex));
                 descriptor.set_fragment_function(Some(&fragment));
                 let color = descriptor
                     .color_attachments()
                     .object_at(0)
                     .ok_or_else(|| anyhow::anyhow!("custom shader color attachment missing"))?;
-                color.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-                color.set_blending_enabled(true);
+                color.set_pixel_format(if raw {
+                    MTLPixelFormat::RGBA16Float
+                } else {
+                    MTLPixelFormat::BGRA8Unorm
+                });
+                color.set_blending_enabled(!raw);
                 color.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
                 color.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
                 color.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
@@ -1208,28 +1222,125 @@ impl MetalRenderer {
                 entry.insert(
                     self.device
                         .new_render_pipeline_state(&descriptor)
-                        .map_err(|error| anyhow::anyhow!("{}: {error}", shader.shader.label()))?,
+                        .map_err(|error| anyhow::anyhow!("{}: {error}", shader.label()))?,
                 )
             }
         };
+        Ok(pipeline.clone())
+    }
+
+    fn prepare_shader_surfaces(
+        &mut self,
+        scene: &Scene,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<Vec<[Option<metal::Texture>; 2]>> {
+        self.shader_images
+            .retain(|_, (owner, _)| owner.strong_count() > 0);
+        let mut roots = Vec::with_capacity(scene.surfaces.len());
+        let mut target_index = 0;
+        for surface in &scene.surfaces {
+            let shader = match &surface.source {
+                gpui::PaintSurfaceSource::Shader(shader) => shader,
+                gpui::PaintSurfaceSource::ImageBuffer(_) => {
+                    roots.push([None, None]);
+                    continue;
+                }
+            };
+            let graph = shader.graph()?;
+            let mut outputs: Vec<metal::Texture> = Vec::with_capacity(graph.len());
+            for (index, node) in graph.iter().enumerate() {
+                let raw = index + 1 < graph.len();
+                let pipeline = self.custom_shader_pipeline(&node.pass.shader, raw)?;
+                let mut inputs = [None, None];
+                for (slot, input) in node.inputs.iter().enumerate() {
+                    inputs[slot] = Some(match input {
+                        Some(gpui::ShaderNodeInput::Pass(index)) => outputs
+                            .get(*index)
+                            .ok_or_else(|| anyhow::anyhow!("shader input pass was not rendered"))?
+                            .clone(),
+                        Some(gpui::ShaderNodeInput::Image(image)) => {
+                            let key = image.key();
+                            if let std::collections::hash_map::Entry::Vacant(entry) =
+                                self.shader_images.entry(key.clone())
+                            {
+                                let (size, bytes) = image.rgba()?;
+                                anyhow::ensure!(
+                                    size[0] <= 16384 && size[1] <= 16384,
+                                    "shader image exceeds maximum texture dimensions"
+                                );
+                                entry.insert((
+                                    Arc::downgrade(&image.image),
+                                    ShaderTexture {
+                                        size,
+                                        texture: ShaderTexture::image(&self.device, size, &bytes),
+                                    },
+                                ));
+                            }
+                            self.shader_images
+                                .get(&key)
+                                .ok_or_else(|| anyhow::anyhow!("shader image upload is missing"))?
+                                .1
+                                .texture
+                                .clone()
+                        }
+                        None => self.empty_shader_input.clone(),
+                    });
+                }
+                if !raw {
+                    roots.push(inputs);
+                    continue;
+                }
+                let size = node.size(surface);
+                anyhow::ensure!(
+                    size[0] <= 16384 && size[1] <= 16384,
+                    "shader target exceeds maximum texture dimensions"
+                );
+                if self
+                    .shader_targets
+                    .get(target_index)
+                    .is_none_or(|target| target.size != size)
+                {
+                    let target = ShaderTexture::target(&self.device, size);
+                    if target_index == self.shader_targets.len() {
+                        self.shader_targets.push(target);
+                    } else {
+                        self.shader_targets[target_index] = target;
+                    }
+                }
+                let target = &self.shader_targets[target_index].texture;
+                let encoder = new_command_encoder_for_texture(
+                    command_buffer,
+                    target,
+                    gpui::size(DevicePixels(size[0] as i32), DevicePixels(size[1] as i32)),
+                    Some(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0)),
+                );
+                let uniforms = node.uniforms(surface, shader.scale_factor);
+                encode_custom_shader(encoder, &pipeline, &uniforms, &inputs);
+                encoder.end_encoding();
+                outputs.push(target.clone());
+                target_index += 1;
+            }
+        }
+        self.shader_targets.truncate(target_index);
+        Ok(roots)
+    }
+
+    fn draw_custom_shader(
+        &mut self,
+        surface: &PaintSurface,
+        shader: &gpui::ShaderSurface,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+        inputs: &[Option<metal::Texture>; 2],
+    ) -> Result<()> {
+        let pipeline = self.custom_shader_pipeline(&shader.pass.shader, false)?;
         let uniforms = shader.uniforms(
             surface,
             [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
             false,
             false,
         );
-        command_encoder.set_render_pipeline_state(pipeline);
-        command_encoder.set_vertex_bytes(
-            0,
-            mem::size_of_val(&uniforms) as u64,
-            uniforms.as_ptr().cast(),
-        );
-        command_encoder.set_fragment_bytes(
-            0,
-            mem::size_of_val(&uniforms) as u64,
-            uniforms.as_ptr().cast(),
-        );
-        command_encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+        encode_custom_shader(command_encoder, &pipeline, &uniforms, inputs);
         Ok(())
     }
 
@@ -1240,6 +1351,7 @@ impl MetalRenderer {
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
+        shader_inputs: &[[Option<metal::Texture>; 2]],
     ) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
@@ -1248,7 +1360,13 @@ impl MetalRenderer {
         for (index, surface) in surfaces.iter().enumerate() {
             let image_buffer = match &surface.source {
                 gpui::PaintSurfaceSource::Shader(shader) => {
-                    self.draw_custom_shader(surface, shader, viewport_size, command_encoder)?;
+                    self.draw_custom_shader(
+                        surface,
+                        shader,
+                        viewport_size,
+                        command_encoder,
+                        &shader_inputs[index],
+                    )?;
                     continue;
                 }
                 gpui::PaintSurfaceSource::ImageBuffer(image_buffer) => image_buffer,
@@ -1328,6 +1446,67 @@ impl MetalRenderer {
         }
         Ok(())
     }
+}
+
+struct ShaderTexture {
+    size: [u32; 2],
+    texture: metal::Texture,
+}
+
+impl ShaderTexture {
+    fn image(device: &metal::DeviceRef, size: [u32; 2], bytes: &[u8]) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size[0] as u64);
+        descriptor.set_height(size[1] as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&descriptor);
+        texture.replace_region(
+            metal::MTLRegion::new_2d(0, 0, size[0] as u64, size[1] as u64),
+            0,
+            bytes.as_ptr().cast(),
+            size[0] as u64 * 4,
+        );
+        texture
+    }
+
+    fn target(device: &metal::DeviceRef, size: [u32; 2]) -> Self {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size[0] as u64);
+        descriptor.set_height(size[1] as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::RGBA16Float);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget);
+        Self {
+            size,
+            texture: device.new_texture(&descriptor),
+        }
+    }
+}
+
+fn encode_custom_shader(
+    encoder: &metal::RenderCommandEncoderRef,
+    pipeline: &metal::RenderPipelineStateRef,
+    uniforms: &[[f32; 4]; 8],
+    inputs: &[Option<metal::Texture>; 2],
+) {
+    encoder.set_render_pipeline_state(pipeline);
+    encoder.set_vertex_bytes(
+        0,
+        mem::size_of_val(uniforms) as u64,
+        uniforms.as_ptr().cast(),
+    );
+    encoder.set_fragment_bytes(
+        0,
+        mem::size_of_val(uniforms) as u64,
+        uniforms.as_ptr().cast(),
+    );
+    for (index, input) in inputs.iter().enumerate() {
+        encoder.set_fragment_texture(index as u64, input.as_deref());
+    }
+    encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
 }
 
 fn new_command_encoder_for_texture<'a>(

@@ -85,6 +85,10 @@ struct DirectXResources {
 
 struct DirectXRenderPipelines {
     custom_shaders: std::collections::HashMap<u64, CustomShaderPipeline>,
+    shader_targets: Vec<ShaderTexture>,
+    shader_images:
+        std::collections::HashMap<RenderImageParams, (std::sync::Weak<RenderImage>, ShaderTexture)>,
+    empty_shader_input: ShaderTexture,
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
@@ -357,6 +361,7 @@ impl DirectXRenderer {
             _ => [0.0f32; 4],
         })?;
         self.upload_scene_buffers(scene)?;
+        let shader_inputs = self.prepare_shader_surfaces(scene)?;
 
         let annotation = self
             .devices
@@ -385,7 +390,9 @@ impl DirectXRenderer {
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                    &scene.surfaces[range.clone()], &shader_inputs[range],
+                ),
             }
             .with_context(|| {
                 format!(
@@ -814,18 +821,158 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
-        let devices = self.devices.as_ref().context("devices missing")?;
-        for surface in surfaces {
+    fn prepare_shader_surfaces(
+        &mut self,
+        scene: &Scene,
+    ) -> Result<Vec<[Option<ID3D11ShaderResourceView>; 2]>> {
+        self.pipelines
+            .shader_images
+            .retain(|_, (owner, _)| owner.strong_count() > 0);
+        if scene.surfaces.is_empty() {
+            self.pipelines.shader_targets.clear();
+            return Ok(Vec::new());
+        }
+        let devices = self.devices.clone().context("devices missing")?;
+        let mut roots = Vec::with_capacity(scene.surfaces.len());
+        let mut target_index = 0;
+        for surface in &scene.surfaces {
             let PaintSurfaceSource::Shader(shader) = &surface.source;
-            let pipeline = match self.pipelines.custom_shaders.entry(shader.shader.id()) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                    CustomShaderPipeline::new(&devices.device, &shader.shader).with_context(
-                        || format!("compiling custom shader {}", shader.shader.label()),
-                    )?,
-                ),
-            };
+            let graph = shader.graph()?;
+            let mut outputs: Vec<ID3D11ShaderResourceView> = Vec::with_capacity(graph.len());
+            for (index, node) in graph.iter().enumerate() {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.pipelines.custom_shaders.entry(node.pass.shader.id())
+                {
+                    entry.insert(
+                        CustomShaderPipeline::new(&devices.device, &node.pass.shader)
+                            .with_context(|| {
+                                format!("compiling custom shader {}", node.pass.shader.label())
+                            })?,
+                    );
+                }
+                let mut inputs = [None, None];
+                for (slot, input) in node.inputs.iter().enumerate() {
+                    inputs[slot] = Some(match input {
+                        Some(ShaderNodeInput::Pass(index)) => outputs
+                            .get(*index)
+                            .context("shader input pass was not rendered")?
+                            .clone(),
+                        Some(ShaderNodeInput::Image(image)) => {
+                            let key = image.key();
+                            if let std::collections::hash_map::Entry::Vacant(entry) =
+                                self.pipelines.shader_images.entry(key.clone())
+                            {
+                                let (size, bytes) = image.rgba()?;
+                                entry.insert((
+                                    Arc::downgrade(&image.image),
+                                    ShaderTexture::new(&devices.device, size, Some(&bytes))?,
+                                ));
+                            }
+                            self.pipelines
+                                .shader_images
+                                .get(&key)
+                                .context("shader image upload is missing")?
+                                .1
+                                .view
+                                .clone()
+                        }
+                        None => self.pipelines.empty_shader_input.view.clone(),
+                    });
+                }
+                if index + 1 == graph.len() {
+                    roots.push(inputs);
+                    continue;
+                }
+                let size = node.size(surface);
+                if self
+                    .pipelines
+                    .shader_targets
+                    .get(target_index)
+                    .is_none_or(|target| target.size != size)
+                {
+                    let target = ShaderTexture::new(&devices.device, size, None)?;
+                    if target_index == self.pipelines.shader_targets.len() {
+                        self.pipelines.shader_targets.push(target);
+                    } else {
+                        self.pipelines.shader_targets[target_index] = target;
+                    }
+                }
+                let target = &self.pipelines.shader_targets[target_index];
+                let target_view = target
+                    .target
+                    .as_ref()
+                    .context("shader render target is missing")?;
+                let pipeline = self
+                    .pipelines
+                    .custom_shaders
+                    .get(&node.pass.shader.id())
+                    .context("custom shader pipeline is missing")?;
+                let uniforms = node.uniforms(surface, shader.scale_factor);
+                update_buffer(
+                    &devices.device_context,
+                    &pipeline.uniforms,
+                    slice::from_ref(&uniforms),
+                )?;
+                unsafe {
+                    devices
+                        .device_context
+                        .PSSetShaderResources(0, Some(&[None, None]));
+                    devices
+                        .device_context
+                        .OMSetRenderTargets(Some(&[Some(target_view.clone())]), None);
+                    devices
+                        .device_context
+                        .ClearRenderTargetView(target_view, &[0.0; 4]);
+                    devices
+                        .device_context
+                        .RSSetViewports(Some(&[D3D11_VIEWPORT {
+                            Width: size[0] as f32,
+                            Height: size[1] as f32,
+                            MaxDepth: 1.0,
+                            ..Default::default()
+                        }]));
+                }
+                pipeline.draw(&devices.device_context, &inputs, true);
+                outputs.push(target.view.clone());
+                target_index += 1;
+            }
+        }
+        self.pipelines.shader_targets.truncate(target_index);
+        let resources = self.resources.as_ref().context("resources missing")?;
+        unsafe {
+            devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None, None]));
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            let buffers = [self.globals.global_params_buffer.clone()];
+            devices
+                .device_context
+                .VSSetConstantBuffers(0, Some(&buffers));
+            devices
+                .device_context
+                .PSSetConstantBuffers(0, Some(&buffers));
+        }
+        Ok(roots)
+    }
+
+    fn draw_surfaces(
+        &mut self,
+        surfaces: &[PaintSurface],
+        inputs: &[[Option<ID3D11ShaderResourceView>; 2]],
+    ) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        for (surface, inputs) in surfaces.iter().zip(inputs) {
+            let PaintSurfaceSource::Shader(shader) = &surface.source;
+            let pipeline = self
+                .pipelines
+                .custom_shaders
+                .get(&shader.pass.shader.id())
+                .context("custom shader pipeline is missing")?;
             let uniforms = shader.uniforms(
                 surface,
                 [self.width as f32, self.height as f32],
@@ -837,23 +984,8 @@ impl DirectXRenderer {
                 &pipeline.uniforms,
                 slice::from_ref(&uniforms),
             )?;
-            set_pipeline_state(
-                &devices.device_context,
-                &[],
-                D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-                &pipeline.vertex,
-                &pipeline.fragment,
-                &pipeline.blend_state,
-            );
+            pipeline.draw(&devices.device_context, inputs, false);
             unsafe {
-                let buffers = [Some(pipeline.uniforms.clone())];
-                devices
-                    .device_context
-                    .VSSetConstantBuffers(0, Some(&buffers));
-                devices
-                    .device_context
-                    .PSSetConstantBuffers(0, Some(&buffers));
-                devices.device_context.Draw(4, 0);
                 let buffers = [self.globals.global_params_buffer.clone()];
                 devices
                     .device_context
@@ -861,6 +993,7 @@ impl DirectXRenderer {
                 devices
                     .device_context
                     .PSSetConstantBuffers(0, Some(&buffers));
+                devices.device_context.PSSetShaderResources(0, Some(&[None, None]));
             }
         }
         Ok(())
@@ -1046,6 +1179,9 @@ impl DirectXRenderPipelines {
 
         Ok(Self {
             custom_shaders: Default::default(),
+            shader_targets: Vec::new(),
+            shader_images: Default::default(),
+            empty_shader_input: ShaderTexture::new(device, [1, 1], Some(&[0; 4]))?,
             shadow_pipeline,
             quad_pipeline,
             path_rasterization_pipeline,
@@ -1150,7 +1286,96 @@ struct CustomShaderPipeline {
     blend_state: ID3D11BlendState,
 }
 
+struct ShaderTexture {
+    size: [u32; 2],
+    view: ID3D11ShaderResourceView,
+    target: Option<ID3D11RenderTargetView>,
+}
+
+impl ShaderTexture {
+    fn new(device: &ID3D11Device, size: [u32; 2], bytes: Option<&[u8]>) -> Result<Self> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: size[0],
+            Height: size[1],
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: if bytes.is_some() {
+                DXGI_FORMAT_R8G8B8A8_UNORM
+            } else {
+                DXGI_FORMAT_R16G16B16A16_FLOAT
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: if bytes.is_some() {
+                D3D11_USAGE_IMMUTABLE
+            } else {
+                D3D11_USAGE_DEFAULT
+            },
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32
+                | if bytes.is_none() {
+                    D3D11_BIND_RENDER_TARGET.0 as u32
+                } else {
+                    0
+                },
+            ..Default::default()
+        };
+        let data = bytes.map(|bytes| D3D11_SUBRESOURCE_DATA {
+            pSysMem: bytes.as_ptr().cast(),
+            SysMemPitch: size[0] * 4,
+            ..Default::default()
+        });
+        let mut texture = None;
+        unsafe {
+            device.CreateTexture2D(
+                &desc,
+                data.as_ref().map(std::ptr::from_ref),
+                Some(&mut texture),
+            )?
+        };
+        let texture = texture.context("creating shader texture")?;
+        let mut view = None;
+        unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut view))? };
+        let mut target = None;
+        if bytes.is_none() {
+            unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut target))? };
+        }
+        Ok(Self {
+            size,
+            view: view.context("creating shader texture view")?,
+            target,
+        })
+    }
+}
+
 impl CustomShaderPipeline {
+    fn draw(
+        &self,
+        context: &ID3D11DeviceContext,
+        inputs: &[Option<ID3D11ShaderResourceView>; 2],
+        raw: bool,
+    ) {
+        set_pipeline_state(
+            context,
+            &[],
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            &self.vertex,
+            &self.fragment,
+            &self.blend_state,
+        );
+        unsafe {
+            if raw {
+                context.OMSetBlendState(None, None, u32::MAX);
+            }
+            let buffers = [Some(self.uniforms.clone())];
+            context.VSSetConstantBuffers(0, Some(&buffers));
+            context.PSSetConstantBuffers(0, Some(&buffers));
+            context.PSSetShaderResources(0, Some(inputs));
+            context.Draw(4, 0);
+        }
+    }
+
     fn new(device: &ID3D11Device, shader: &CustomShader) -> Result<Self> {
         fn compile(source: &str, entry: &str, target: &str) -> Result<Vec<u8>> {
             use std::ffi::CString;

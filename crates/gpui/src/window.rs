@@ -5071,6 +5071,18 @@ impl Window {
         shader: Arc<crate::CustomShader>,
         parameters: [[f32; 4]; 4],
     ) {
+        self.paint_shader_pass(
+            bounds,
+            Arc::new(crate::ShaderPass {
+                shader,
+                parameters,
+                inputs: [None, None],
+            }),
+        );
+    }
+
+    /// Paint a shader graph, evaluating shared inputs into reusable floating-point targets.
+    pub fn paint_shader_pass(&mut self, bounds: Bounds<Pixels>, pass: Arc<crate::ShaderPass>) {
         self.invalidator.debug_assert_paint();
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
@@ -5081,8 +5093,7 @@ impl Window {
             bounds,
             content_mask,
             source: crate::PaintSurfaceSource::Shader(crate::ShaderSurface {
-                shader,
-                parameters,
+                pass,
                 scale_factor,
                 opacity,
             }),
